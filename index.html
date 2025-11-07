@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>地理院地図＋コンパス補正（磁気ドリフト検知対応）</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+  html, body, #map { height: 100%; margin: 0; padding: 0; }
+  #controls {
+    position: absolute; top: 10px; left: 10px; z-index: 1000;
+    background: rgba(200,220,255,0.9);
+    padding: 12px; border-radius: 10px;
+    box-shadow: 0 0 6px rgba(0,0,0,0.3);
+    font-size: 15px; transition: background 0.5s;
+  }
+  button {
+    margin: 6px 0; width: 180px; height: 48px; font-size: 16px;
+    border: none; border-radius: 10px; cursor: pointer;
+    background: #007bff; color: #fff; font-weight: bold;
+  }
+  #resetBtn { background: #555; }
+  #info { margin-top: 5px; font-weight: bold; }
+</style>
+</head>
+<body>
+<div id="controls">
+  <button id="lockBtn">🎯 ターゲットロックオン</button><br>
+  <button id="resetBtn">🔁 補正リセット</button><br>
+  <div id="info">補正角: 0°</div>
+</div>
+<div id="map"></div>
+
+<script>
+let map = L.map('map');
+L.tileLayer('https://cyberjapandata.gsi.go.jp/xyz/std/{z}/{x}/{y}.png', {
+  attribution: '地理院地図', maxZoom: 18
+}).addTo(map);
+
+let currentLat = null, currentLon = null;
+let currentHeading = 0, measuredHeading = null, correctionOffset = 0;
+let headingLine = null, targetMarker = null;
+let targetSelectMode = false;
+let userMarker = L.circleMarker([0,0], {radius:6, color:'blue', fillColor:'blue', fillOpacity:0.8}).addTo(map);
+
+// 初期位置を現在地に設定
+navigator.geolocation.getCurrentPosition(pos => {
+  currentLat = pos.coords.latitude;
+  currentLon = pos.coords.longitude;
+  map.setView([currentLat, currentLon], 14);
+  userMarker.setLatLng([currentLat, currentLon]);
+}, err => {
+  console.warn('現在地取得失敗:', err);
+  map.setView([35.6812,139.7671], 13); // fallback: 東京駅
+});
+
+// 現在地追跡
+navigator.geolocation.watchPosition(pos => {
+  currentLat = pos.coords.latitude;
+  currentLon = pos.coords.longitude;
+  userMarker.setLatLng([currentLat, currentLon]);
+  updateLine();
+}, err => {
+  console.warn('位置情報取得に失敗しました:', err);
+}, { enableHighAccuracy: true, maximumAge: 1000 });
+
+// コンパス読み込み
+if (window.DeviceOrientationEvent) {
+  window.addEventListener('deviceorientationabsolute' in window ? 'deviceorientationabsolute' : 'deviceorientation', e => {
+    if (e.absolute || e.webkitCompassHeading !== undefined) {
+      currentHeading = e.webkitCompassHeading || 360 - e.alpha;
+      updateLine();
+    }
+  });
+}
+
+// ターゲットロックオン
+const lockBtn = document.getElementById('lockBtn');
+const controls = document.getElementById('controls');
+lockBtn.onclick = () => {
+  if (currentHeading == null) { alert('方位センサーが未取得です'); return; }
+  measuredHeading = currentHeading;
+  alert(`ターゲットロックオン！ (${measuredHeading.toFixed(1)}°)\n地図上で目標をタップしてください。`);
+  targetSelectMode = true;
+};
+
+// 地図クリックで補正
+map.on('click', e => {
+  if (!targetSelectMode || measuredHeading == null || currentLat == null) return;
+  const bearing = getBearing(currentLat, currentLon, e.latlng.lat, e.latlng.lng);
+  correctionOffset = measuredHeading - bearing;
+  if (correctionOffset > 180) correctionOffset -= 360;
+  if (correctionOffset < -180) correctionOffset += 360;
+  document.getElementById('info').innerText = `補正角: ${correctionOffset.toFixed(1)}°`;
+
+  // ステータスバー色変更
+  controls.style.background = 'rgba(255,210,210,0.9)';
+
+  // ターゲットマーカー表示
+  if (targetMarker) targetMarker.remove();
+  targetMarker = L.marker([e.latlng.lat, e.latlng.lng], {title: 'ターゲット'}).addTo(map);
+
+  alert(`補正角を計算しました: ${correctionOffset.toFixed(1)}°`);
+  targetSelectMode = false;
+  updateLine();
+});
+
+// リセット
+const resetBtn = document.getElementById('resetBtn');
+resetBtn.onclick = () => {
+  correctionOffset = 0;
+  measuredHeading = null;
+  targetSelectMode = false;
+  document.getElementById('info').innerText = '補正角: 0°';
+  controls.style.background = 'rgba(200,220,255,0.9)';
+  if (targetMarker) targetMarker.remove();
+  updateLine();
+
+  // ドリフト警告をリセット
+  const driftEl = document.getElementById('driftAlert');
+  if (driftEl) driftEl.remove();
+  driftDetected = false;
+};
+
+// 磁気ドリフト検知（姿勢安定中）
+let lastHeading = null, lastPitch = null, lastRoll = null, lastCheck = Date.now();
+let driftDetected = false;
+
+window.addEventListener('deviceorientation', e => {
+  const heading = e.webkitCompassHeading || 360 - e.alpha;
+  const pitch = e.beta;
+  const roll = e.gamma;
+
+  if (lastHeading != null) {
+    const dh = Math.abs(heading - lastHeading);
+    const dp = Math.abs(pitch - lastPitch);
+    const dr = Math.abs(roll - lastRoll);
+    const dt = Date.now() - lastCheck;
+
+    if (dt > 1000 && dp < 3 && dr < 3 && dh > 25) {
+      console.warn(`[ドリフト検知] dh=${dh.toFixed(1)}°, dp=${dp.toFixed(1)}°, dr=${dr.toFixed(1)}°`);
+      showDriftAlert();
+      driftDetected = true;
+    }
+  }
+
+  lastHeading = heading;
+  lastPitch = pitch;
+  lastRoll = roll;
+  lastCheck = Date.now();
+});
+
+function showDriftAlert() {
+  if (document.getElementById('driftAlert')) return;
+  const infoBox = document.getElementById('info');
+  const alertEl = document.createElement('div');
+  alertEl.id = 'driftAlert';
+  alertEl.textContent = '⚠️ 磁気ドリフト疑い検知';
+  alertEl.style.color = 'red';
+  alertEl.style.fontWeight = 'bold';
+  alertEl.style.marginTop = '4px';
+  infoBox.insertAdjacentElement('afterend', alertEl);
+}
+
+function updateLine() {
+  if (currentLat == null || currentLon == null) return;
+  let corrected = currentHeading - correctionOffset;
+  const end = computeDestinationPoint(currentLat, currentLon, corrected, 100000);
+  if (headingLine) headingLine.remove();
+  const color = correctionOffset === 0 ? 'blue' : 'red';
+  headingLine = L.polyline([[currentLat, currentLon], [end.lat, end.lon]], {color: color, weight:4}).addTo(map);
+}
+
+function getBearing(lat1, lon1, lat2, lon2) {
+  const φ1 = lat1 * Math.PI / 180, φ2 = lat2 * Math.PI / 180;
+  const Δλ = (lon2 - lon1) * Math.PI / 180;
+  const y = Math.sin(Δλ) * Math.cos(φ2);
+  const x = Math.cos(φ1)*Math.sin(φ2) - Math.sin(φ1)*Math.cos(φ2)*Math.cos(Δλ);
+  const θ = Math.atan2(y, x);
+  return (θ * 180 / Math.PI + 360) % 360;
+}
+
+function computeDestinationPoint(lat, lon, bearing, distance) {
+  const R = 6371000;
+  const δ = distance / R;
+  const θ = bearing * Math.PI / 180;
+  const φ1 = lat * Math.PI / 180;
+  const λ1 = lon * Math.PI / 180;
+  const φ2 = Math.asin(Math.sin(φ1)*Math.cos(δ) + Math.cos(φ1)*Math.sin(δ)*Math.cos(θ));
+  const λ2 = λ1 + Math.atan2(Math.sin(θ)*Math.sin(δ)*Math.cos(φ1), Math.cos(δ)-Math.sin(φ1)*Math.sin(φ2));
+  return { lat: φ2*180/Math.PI, lon: λ2*180/Math.PI };
+}
+</script>
+</body>
+</html>
