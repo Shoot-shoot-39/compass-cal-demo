@@ -2,7 +2,7 @@
 <html lang="ja">
 <head>
 <meta charset="utf-8">
-<title>地理院地図＋コンパス補正（磁気ドリフト検知対応）</title>
+<title>補正式（磁気ドリフト検知対応）</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
@@ -20,12 +20,17 @@
     border: none; border-radius: 10px; cursor: pointer;
     background: #007bff; color: #fff; font-weight: bold;
   }
+  #sensorBtn {
+    width: 140px; height: 32px; font-size: 13px;
+    background: #28a745; margin-top: 4px;
+  }
   #resetBtn { background: #555; }
   #info { margin-top: 5px; font-weight: bold; }
 </style>
 </head>
 <body>
 <div id="controls">
+  <button id="sensorBtn">📍 方位センサー許可</button><br>
   <button id="lockBtn">🎯 ターゲットロックオン</button><br>
   <button id="resetBtn">🔁 補正リセット</button><br>
   <div id="info">補正角: 0°</div>
@@ -44,7 +49,6 @@ let headingLine = null, targetMarker = null;
 let targetSelectMode = false;
 let userMarker = L.circleMarker([0,0], {radius:6, color:'blue', fillColor:'blue', fillOpacity:0.8}).addTo(map);
 
-// 初期位置を現在地に設定
 navigator.geolocation.getCurrentPosition(pos => {
   currentLat = pos.coords.latitude;
   currentLon = pos.coords.longitude;
@@ -52,10 +56,9 @@ navigator.geolocation.getCurrentPosition(pos => {
   userMarker.setLatLng([currentLat, currentLon]);
 }, err => {
   console.warn('現在地取得失敗:', err);
-  map.setView([35.6812,139.7671], 13); // fallback: 東京駅
+  map.setView([35.6812,139.7671], 13);
 });
 
-// 現在地追跡
 navigator.geolocation.watchPosition(pos => {
   currentLat = pos.coords.latitude;
   currentLon = pos.coords.longitude;
@@ -65,17 +68,37 @@ navigator.geolocation.watchPosition(pos => {
   console.warn('位置情報取得に失敗しました:', err);
 }, { enableHighAccuracy: true, maximumAge: 1000 });
 
-// コンパス読み込み
-if (window.DeviceOrientationEvent) {
-  window.addEventListener('deviceorientationabsolute' in window ? 'deviceorientationabsolute' : 'deviceorientation', e => {
-    if (e.absolute || e.webkitCompassHeading !== undefined) {
-      currentHeading = e.webkitCompassHeading || 360 - e.alpha;
-      updateLine();
+const sensorBtn = document.getElementById('sensorBtn');
+sensorBtn.onclick = async () => {
+  if (typeof DeviceOrientationEvent.requestPermission === 'function') {
+    try {
+      const response = await DeviceOrientationEvent.requestPermission();
+      if (response === 'granted') {
+        startCompass();
+        sensorBtn.style.display = 'none';
+      } else {
+        alert('方位センサーが許可されませんでした。');
+      }
+    } catch (err) {
+      alert('センサー許可処理でエラー: ' + err);
     }
-  });
+  } else {
+    startCompass();
+    sensorBtn.style.display = 'none';
+  }
+};
+
+function startCompass() {
+  if (window.DeviceOrientationEvent) {
+    window.addEventListener('deviceorientationabsolute' in window ? 'deviceorientationabsolute' : 'deviceorientation', e => {
+      if (e.absolute || e.webkitCompassHeading !== undefined) {
+        currentHeading = e.webkitCompassHeading || 360 - e.alpha;
+        updateLine();
+      }
+    });
+  }
 }
 
-// ターゲットロックオン
 const lockBtn = document.getElementById('lockBtn');
 const controls = document.getElementById('controls');
 lockBtn.onclick = () => {
@@ -85,7 +108,6 @@ lockBtn.onclick = () => {
   targetSelectMode = true;
 };
 
-// 地図クリックで補正
 map.on('click', e => {
   if (!targetSelectMode || measuredHeading == null || currentLat == null) return;
   const bearing = getBearing(currentLat, currentLon, e.latlng.lat, e.latlng.lng);
@@ -93,20 +115,14 @@ map.on('click', e => {
   if (correctionOffset > 180) correctionOffset -= 360;
   if (correctionOffset < -180) correctionOffset += 360;
   document.getElementById('info').innerText = `補正角: ${correctionOffset.toFixed(1)}°`;
-
-  // ステータスバー色変更
   controls.style.background = 'rgba(255,210,210,0.9)';
-
-  // ターゲットマーカー表示
   if (targetMarker) targetMarker.remove();
   targetMarker = L.marker([e.latlng.lat, e.latlng.lng], {title: 'ターゲット'}).addTo(map);
-
   alert(`補正角を計算しました: ${correctionOffset.toFixed(1)}°`);
   targetSelectMode = false;
   updateLine();
 });
 
-// リセット
 const resetBtn = document.getElementById('resetBtn');
 resetBtn.onclick = () => {
   correctionOffset = 0;
@@ -116,14 +132,11 @@ resetBtn.onclick = () => {
   controls.style.background = 'rgba(200,220,255,0.9)';
   if (targetMarker) targetMarker.remove();
   updateLine();
-
-  // ドリフト警告をリセット
   const driftEl = document.getElementById('driftAlert');
   if (driftEl) driftEl.remove();
   driftDetected = false;
 };
 
-// 磁気ドリフト検知（姿勢安定中）
 let lastHeading = null, lastPitch = null, lastRoll = null, lastCheck = Date.now();
 let driftDetected = false;
 
@@ -131,20 +144,16 @@ window.addEventListener('deviceorientation', e => {
   const heading = e.webkitCompassHeading || 360 - e.alpha;
   const pitch = e.beta;
   const roll = e.gamma;
-
   if (lastHeading != null) {
     const dh = Math.abs(heading - lastHeading);
     const dp = Math.abs(pitch - lastPitch);
     const dr = Math.abs(roll - lastRoll);
     const dt = Date.now() - lastCheck;
-
     if (dt > 1000 && dp < 3 && dr < 3 && dh > 25) {
-      console.warn(`[ドリフト検知] dh=${dh.toFixed(1)}°, dp=${dp.toFixed(1)}°, dr=${dr.toFixed(1)}°`);
       showDriftAlert();
       driftDetected = true;
     }
   }
-
   lastHeading = heading;
   lastPitch = pitch;
   lastRoll = roll;
